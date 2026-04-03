@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import math
+import time
 import inspect
 import os
 import warnings
@@ -2121,6 +2123,7 @@ class GenerationMixin:
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         use_model_defaults: Optional[bool] = None,
+        csmr_args: Optional[Dict] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -2412,6 +2415,7 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                csmr_args=csmr_args,
                 **model_kwargs,
             )
         elif generation_mode == GenerationMode.DOLA_GENERATION:
@@ -4608,6 +4612,7 @@ class GenerationMixin:
         generation_config: GenerationConfig,
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
+        csmr_args: Optional[Dict],
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -4676,6 +4681,17 @@ class GenerationMixin:
 
         this_peer_finished = False
         is_first_iteration = True  # to preserve the same API in the output as other generation methods
+        # CSMR: GPU ring buffer and async fault flag for zero-sync detection on no-fault path
+        if csmr_args is not None:
+            _csmr_win = csmr_args["window_size"]
+            _csmr_buf = torch.zeros(_csmr_win, dtype=torch.float32, device=input_ids.device)
+            _csmr_buf_pos = 0   # next write slot (Python int, grows unbounded, use % _csmr_win)
+            _csmr_buf_count = 0  # valid entries written so far, capped at _csmr_win
+            _csmr_thresh = torch.tensor(csmr_args["threshold"], dtype=torch.float32, device=input_ids.device)
+            _csmr_flag_gpu = torch.zeros(1, dtype=torch.bool, device=input_ids.device)
+            _csmr_flag_cpu = torch.zeros(1, dtype=torch.bool).pin_memory()
+            _csmr_event = torch.cuda.Event()
+            _csmr_event_valid = False
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             cur_len = input_ids.shape[-1]
 
@@ -4757,6 +4773,57 @@ class GenerationMixin:
                 if is_done_candidate and n_matches == candidate_length:
                     n_matches -= 1
                 valid_tokens = selected_tokens[:, : n_matches + 1]
+            
+            # CSMR logic: compare draft vs. target distributions to detect faults
+            if csmr_args is not None and candidate_logits is not None:
+                # Check the fault flag written by the previous step (non-blocking).
+                # By this point a full draft + target forward pass has elapsed since the async DMA
+                # was issued, so event.query() will virtually always be True immediately.
+                if _csmr_event_valid and _csmr_event.query():
+                    _csmr_event_valid = False
+                    if _csmr_flag_cpu.item():  # CPU-only read from pinned memory, no GPU sync
+                        if csmr_args.get("prior_false_positive", False):
+                            logger.info("CSMR detection triggered but ignoring due to prior false positive")
+                        else:
+                            raise csmr_args["fault_exception_class"]("CSMR fault detected")
+
+                n_compare = min(int(n_matches) + 1, candidate_length)
+                if n_compare > 0:
+                    draft_logits_csmr = candidate_logits[0, :n_compare, :].to(torch.float32)
+                    target_logits_csmr = new_logits[0, :n_compare, :].to(torch.float32)
+
+                    target_log_probs = F.log_softmax(target_logits_csmr, dim=-1)
+                    draft_log_probs = F.log_softmax(draft_logits_csmr, dim=-1)
+
+                    # NLL of accepted tokens under draft distribution
+                    target_tokens_csmr = valid_tokens[0, :n_compare]
+                    nll = -draft_log_probs.gather(dim=-1, index=target_tokens_csmr.unsqueeze(-1)).squeeze(-1)
+
+                    # JS divergence between draft and target distributions
+                    log_m = torch.logaddexp(draft_log_probs, target_log_probs) - math.log(2.0)
+                    kl_p_m = F.kl_div(log_m, draft_log_probs, log_target=True, reduction="none").nan_to_num(0.0).sum(dim=-1)
+                    kl_q_m = F.kl_div(log_m, target_log_probs, log_target=True, reduction="none").nan_to_num(0.0).sum(dim=-1)
+                    js = 0.5 * kl_p_m + 0.5 * kl_q_m
+
+                    # RobustScaler normalization
+                    rs_nll = (nll - csmr_args["nll_median"]) / csmr_args["nll_iqr"]
+                    rs_js = (js - csmr_args["js_median"]) / csmr_args["js_iqr"]
+                    csmr_scores = torch.max(rs_nll, rs_js)  # shape: (n_compare,), stays on GPU
+
+                    # Write scores into GPU ring buffer
+                    write_pos = (torch.arange(n_compare, device=csmr_scores.device) + (_csmr_buf_pos % _csmr_win)) % _csmr_win
+                    _csmr_buf.scatter_(0, write_pos, csmr_scores)
+                    _csmr_buf_pos += n_compare
+                    _csmr_buf_count = min(_csmr_buf_count + n_compare, _csmr_win)
+
+                    # Once the buffer is full, compute the windowed mean and write the fault flag
+                    # asynchronously — no CPU sync on the no-fault path.
+                    if _csmr_buf_count >= _csmr_win:
+                        windowed_mean = _csmr_buf.mean()                            # GPU op
+                        _csmr_flag_gpu[0] = windowed_mean >= _csmr_thresh           # GPU op
+                        _csmr_flag_cpu.copy_(_csmr_flag_gpu, non_blocking=True)     # async DMA to pinned memory
+                        _csmr_event.record()                                         # marks when DMA is enqueued
+                        _csmr_event_valid = True
 
             # 4. Update variables according to the number of matching assistant tokens. Remember: the token generated
             # by the model after the last candidate match is also valid, as it is generated from a correct sequence.
@@ -4830,6 +4897,14 @@ class GenerationMixin:
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
             is_first_iteration = False
+
+        # CSMR: flush any pending fault flag from the last step.
+        # All GPU work is done here so synchronize() is effectively free.
+        if csmr_args is not None and _csmr_event_valid:
+            _csmr_event.synchronize()
+            if _csmr_flag_cpu.item():
+                if not csmr_args.get("prior_false_positive", False):
+                    raise csmr_args["fault_exception_class"]("CSMR fault detected at end of generation")
 
         if streamer is not None:
             streamer.end()
