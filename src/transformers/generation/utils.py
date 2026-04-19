@@ -4777,8 +4777,6 @@ class GenerationMixin:
             # CSMR logic: compare draft vs. target distributions to detect faults
             if csmr_args is not None and candidate_logits is not None:
                 # Check the fault flag written by the previous step (non-blocking).
-                # By this point a full draft + target forward pass has elapsed since the async DMA
-                # was issued, so event.query() will virtually always be True immediately.
                 if _csmr_event_valid and _csmr_event.query():
                     _csmr_event_valid = False
                     if _csmr_flag_cpu.item():  # CPU-only read from pinned memory, no GPU sync
@@ -4787,28 +4785,34 @@ class GenerationMixin:
                         else:
                             raise csmr_args["fault_exception_class"]("CSMR fault detected")
 
-                n_compare = min(int(n_matches) + 1, candidate_length)
+                # The number of accepted tokens we can actually compare (cap at candidate_length)
+                n_compare = min(valid_tokens.shape[1], candidate_length)
+
                 if n_compare > 0:
                     draft_logits_csmr = candidate_logits[0, :n_compare, :].to(torch.float32)
                     target_logits_csmr = new_logits[0, :n_compare, :].to(torch.float32)
 
+                    # Use log_softmax for numerical stability (prevents -inf from .log(0.0))
                     target_log_probs = F.log_softmax(target_logits_csmr, dim=-1)
                     draft_log_probs = F.log_softmax(draft_logits_csmr, dim=-1)
 
+                    p = torch.exp(target_log_probs)
+                    q = torch.exp(draft_log_probs)
+
                     # NLL of accepted tokens under draft distribution
-                    target_tokens_csmr = valid_tokens[0, :n_compare]
+                    target_tokens_csmr = valid_tokens[0, :n_compare] 
                     nll = -draft_log_probs.gather(dim=-1, index=target_tokens_csmr.unsqueeze(-1)).squeeze(-1)
 
-                    # JS divergence between draft and target distributions
+                    # Mathematically stable JS divergence
                     log_m = torch.logaddexp(draft_log_probs, target_log_probs) - math.log(2.0)
-                    kl_p_m = F.kl_div(log_m, draft_log_probs, log_target=True, reduction="none").nan_to_num(0.0).sum(dim=-1)
-                    kl_q_m = F.kl_div(log_m, target_log_probs, log_target=True, reduction="none").nan_to_num(0.0).sum(dim=-1)
-                    js = 0.5 * kl_p_m + 0.5 * kl_q_m
+                    kl_p = (p * (target_log_probs - log_m)).nan_to_num(0.0).sum(dim=-1)
+                    kl_q = (q * (draft_log_probs - log_m)).nan_to_num(0.0).sum(dim=-1)
+                    js = 0.5 * (kl_p + kl_q)
 
                     # RobustScaler normalization
                     rs_nll = (nll - csmr_args["nll_median"]) / csmr_args["nll_iqr"]
                     rs_js = (js - csmr_args["js_median"]) / csmr_args["js_iqr"]
-                    csmr_scores = torch.max(rs_nll, rs_js)  # shape: (n_compare,), stays on GPU
+                    csmr_scores = torch.max(rs_nll, rs_js)  # shape: (n_compare,)
 
                     # Write scores into GPU ring buffer
                     write_pos = (torch.arange(n_compare, device=csmr_scores.device) + (_csmr_buf_pos % _csmr_win)) % _csmr_win
@@ -4817,12 +4821,11 @@ class GenerationMixin:
                     _csmr_buf_count = min(_csmr_buf_count + n_compare, _csmr_win)
 
                     # Once the buffer is full, compute the windowed mean and write the fault flag
-                    # asynchronously — no CPU sync on the no-fault path.
                     if _csmr_buf_count >= _csmr_win:
                         windowed_mean = _csmr_buf.mean()                            # GPU op
                         _csmr_flag_gpu[0] = windowed_mean >= _csmr_thresh           # GPU op
                         _csmr_flag_cpu.copy_(_csmr_flag_gpu, non_blocking=True)     # async DMA to pinned memory
-                        _csmr_event.record()                                         # marks when DMA is enqueued
+                        _csmr_event.record()                                        # marks when DMA is enqueued
                         _csmr_event_valid = True
 
             # 4. Update variables according to the number of matching assistant tokens. Remember: the token generated
