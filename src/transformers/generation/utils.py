@@ -4903,11 +4903,20 @@ class GenerationMixin:
 
         # CSMR: flush any pending fault flag from the last step.
         # All GPU work is done here so synchronize() is effectively free.
-        if csmr_args is not None and _csmr_event_valid:
-            _csmr_event.synchronize()
-            if _csmr_flag_cpu.item():
-                if not csmr_args.get("prior_false_positive", False):
-                    raise csmr_args["fault_exception_class"]("CSMR fault detected at end of generation")
+        if csmr_args is not None:
+            _csmr_fault = False
+
+            if _csmr_event_valid:
+                _csmr_event.synchronize()
+                _csmr_fault = bool(_csmr_flag_cpu.item())
+            elif 0 < _csmr_buf_count < _csmr_win:
+                # Generation ended before the window ever filled, so no flag was written.
+                # Score the mean over whatever we collected.
+                _csmr_partial_mean = _csmr_buf[:_csmr_buf_count].mean()
+                _csmr_fault = bool((_csmr_partial_mean >= _csmr_thresh).item())
+
+            if _csmr_fault and not csmr_args.get("prior_false_positive", False):
+                raise csmr_args["fault_exception_class"]("CSMR fault detected at end of generation")
 
         if streamer is not None:
             streamer.end()
