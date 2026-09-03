@@ -4685,7 +4685,6 @@ class GenerationMixin:
         if csmr_args is not None:
             _csmr_win = csmr_args["window_size"]
             _csmr_buf = torch.zeros(_csmr_win, dtype=torch.float32, device=input_ids.device)
-            _csmr_buf_pos = 0   # next write slot (Python int, grows unbounded, use % _csmr_win)
             _csmr_buf_count = 0  # valid entries written so far, capped at _csmr_win
             _csmr_thresh = torch.tensor(csmr_args["threshold"], dtype=torch.float32, device=input_ids.device)
             _csmr_flag_gpu = torch.zeros(1, dtype=torch.bool, device=input_ids.device)
@@ -4814,18 +4813,19 @@ class GenerationMixin:
                     rs_js = (js - csmr_args["js_median"]) / csmr_args["js_iqr"]
                     csmr_scores = torch.max(rs_nll, rs_js)  # shape: (n_compare,)
 
-                    # Write scores into GPU ring buffer
-                    write_pos = (torch.arange(n_compare, device=csmr_scores.device) + (_csmr_buf_pos % _csmr_win)) % _csmr_win
-                    _csmr_buf.scatter_(0, write_pos, csmr_scores)
-                    _csmr_buf_pos += n_compare
+                    # Append the new scores to the rolling window of recent scores
+                    all_scores = torch.cat((_csmr_buf[:_csmr_buf_count], csmr_scores))
+                    _csmr_buf = all_scores[-_csmr_win:].clone()
                     _csmr_buf_count = min(_csmr_buf_count + n_compare, _csmr_win)
 
-                    # Once the buffer is full, compute the windowed mean and write the fault flag
-                    if _csmr_buf_count >= _csmr_win:
-                        windowed_mean = _csmr_buf.mean()                            # GPU op
-                        _csmr_flag_gpu[0] = windowed_mean >= _csmr_thresh           # GPU op
-                        _csmr_flag_cpu.copy_(_csmr_flag_gpu, non_blocking=True)     # async DMA to pinned memory
-                        _csmr_event.record()                                        # marks when DMA is enqueued
+                    # Take the max over every window ending on a newly accepted token, since a
+                    # single step can accept several
+                    if all_scores.shape[0] >= _csmr_win:
+                        window_means = all_scores.unfold(0, _csmr_win, 1).mean(dim=-1)  # GPU op
+                        windowed_mean = window_means[-n_compare:].max()                 # GPU op
+                        _csmr_flag_gpu[0] = windowed_mean >= _csmr_thresh               # GPU op
+                        _csmr_flag_cpu.copy_(_csmr_flag_gpu, non_blocking=True)         # async DMA to pinned memory
+                        _csmr_event.record()                                            # marks when DMA is enqueued
                         _csmr_event_valid = True
 
             # 4. Update variables according to the number of matching assistant tokens. Remember: the token generated
